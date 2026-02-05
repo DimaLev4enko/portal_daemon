@@ -1,164 +1,232 @@
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io::Write;
-use std::process::Command;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Write};
 use std::path::Path;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use std::os::unix::fs::PermissionsExt;
 
+// --- КОНФИГУРАЦИЯ (JSON) ---
+#[derive(Serialize, Deserialize, Debug)]
+struct PortalConfig {
+    lighthouse_ip: String,
+    sleep_minutes: u64,
+    grace_period_sec: u64,
+}
+
+// Значения по умолчанию
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self {
+            lighthouse_ip: "192.168.1.1".to_string(),
+            sleep_minutes: 60,
+            grace_period_sec: 300,
+        }
+    }
+}
+
+// --- АРГУМЕНТЫ ЗАПУСКА ---
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Запустить режим установки (настройка прав и групп)
+    /// Настроить права доступа (root/doas setup)
     #[arg(long)]
     install: bool,
+
+    /// Изменить настройки (IP, Таймеры)
+    #[arg(long)]
+    configure: bool,
 }
 
+const CONFIG_FILE: &str = "portal_config.json";
 const GROUP_NAME: &str = "portal-admins";
-const SUDOERS_FILE: &str = "/etc/sudoers.d/portal-daemon";
 const DOAS_CONF: &str = "/etc/doas.conf";
+const SUDOERS_FILE: &str = "/etc/sudoers.d/portal-daemon";
 
 fn main() {
     let args = Args::parse();
 
+    // 1. Если просят установить системные права
     if args.install {
-        run_installation();
+        run_system_install();
+        return;
+    }
+
+    // 2. Загружаем конфиг. Если его нет или просят перенастроить — запускаем визард.
+    let config = if args.configure || !Path::new(CONFIG_FILE).exists() {
+        run_interactive_wizard()
     } else {
-        run_daemon();
-    }
-}
-
-fn run_installation() {
-    println!("🚀 Запуск мастера установки Portal Daemon...");
-
-    // 1. Проверка Root
-    let output = Command::new("id").arg("-u").output().expect("Не удалось выполнить id");
-    let uid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    
-    if uid_str != "0" {
-        eprintln!("❌ Ошибка: Запустите через root (sudo/doas ./portal_daemon --install)");
-        std::process::exit(1);
-    }
-
-    // 2. Определение реального пользователя (Sudo vs Doas)
-    let real_user = match env::var("SUDO_USER") {
-        Ok(u) => Some(u),
-        Err(_) => env::var("DOAS_USER").ok(), // Пробуем найти пользователя Doas
+        load_config()
     };
 
-    // 3. Создание группы
-    let status = Command::new("groupadd").arg("-f").arg(GROUP_NAME).status().expect("Ошибка groupadd");
-    if status.success() {
-        println!("✅ Группа {} проверена.", GROUP_NAME);
-    }
-
-    // 4. Добавление пользователя в группу
-    if let Some(user) = real_user {
-        let status = Command::new("usermod").args(["-aG", GROUP_NAME, &user]).status().expect("Ошибка usermod");
-        if status.success() {
-            println!("✅ Пользователь {} добавлен в группу {}.", user, GROUP_NAME);
-        }
-    } else {
-        println!("⚠️  Не удалось определить реального пользователя. Добавьте себя в группу '{}' вручную.", GROUP_NAME);
-    }
-
-    // 5. Поиск путей к бинарникам
-    let rtcwake = find_binary("rtcwake").expect("❌ rtcwake не найден!");
-    let nmcli = find_binary("nmcli").expect("❌ nmcli не найден!");
-    println!("✅ Утилиты найдены:\n   {}\n   {}", rtcwake, nmcli);
-
-    // 6. ВЫБОР СТРАТЕГИИ: DOAS или SUDO
-    if Path::new(DOAS_CONF).exists() {
-        println!("🦅 Обнаружен Doas. Применяем конфигурацию для Gentoo/BSD style...");
-        setup_doas(&rtcwake, &nmcli);
-    } else if find_binary("visudo").is_some() {
-        println!("🐧 Обнаружен Sudo. Применяем стандартную конфигурацию...");
-        setup_sudo(&rtcwake, &nmcli);
-    } else {
-        eprintln!("❌ Не найдено ни sudo (visudo), ни doas.conf. Не могу настроить права.");
-        std::process::exit(1);
-    }
+    // 3. Запускаем Демона
+    run_daemon(config);
 }
 
-// --- ЛОГИКА DOAS ---
-fn setup_doas(rtcwake: &str, nmcli: &str) {
-    // В Doas нет директории .d (обычно), пишем в основной файл, но делаем бэкап.
-    let backup_path = format!("{}.bak", DOAS_CONF);
-    fs::copy(DOAS_CONF, &backup_path).expect("Не удалось создать бэкап doas.conf");
-    println!("📦 Создан бэкап конфигурации: {}", backup_path);
+// === ИНТЕРАКТИВНАЯ НАСТРОЙКА ===
+fn run_interactive_wizard() -> PortalConfig {
+    println!("\n🔧 --- МАСТЕР НАСТРОЙКИ PORTAL ---");
+    println!("Давай настроим параметры выживания.\n");
 
-    // Читаем текущий конфиг, чтобы не дублировать строки
-    let current_conf = fs::read_to_string(DOAS_CONF).unwrap_or_default();
+    let ip = prompt("1. Введи IP Маяка (роутер/удлинитель) [по умолчанию 192.168.1.1]: ");
+    let ip = if ip.is_empty() { "192.168.1.1".to_string() } else { ip };
+
+    let sleep_str = prompt("2. На сколько МИНУТ уходить в сон, если света нет? [по умолчанию 60]: ");
+    let sleep_minutes: u64 = sleep_str.parse().unwrap_or(60);
+
+    let grace_str = prompt("3. Грейс-период (сек) перед сном (защита от мигания) [по умолчанию 300]: ");
+    let grace_period_sec: u64 = grace_str.parse().unwrap_or(300);
+
+    let config = PortalConfig {
+        lighthouse_ip: ip,
+        sleep_minutes,
+        grace_period_sec,
+    };
+
+    // Сохраняем в JSON
+    let json = serde_json::to_string_pretty(&config).expect("Ошибка сериализации");
+    fs::write(CONFIG_FILE, json).expect("Не удалось сохранить конфиг");
     
-    // Формируем правила. Синтаксис: permit nopass :group cmd /path/to/bin
-    // Важно: Doas требует отдельные строки для каждой команды (обычно)
-    let rule_rtc = format!("permit nopass :{} cmd {}", GROUP_NAME, rtcwake);
-    let rule_net = format!("permit nopass :{} cmd {}", GROUP_NAME, nmcli);
+    println!("✅ Настройки сохранены в файл: {}", CONFIG_FILE);
+    println!("----------------------------------\n");
+    
+    config
+}
 
-    let mut new_conf = current_conf.clone();
-    let mut changed = false;
+fn prompt(text: &str) -> String {
+    print!("{}", text);
+    io::stdout().flush().unwrap();
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer).unwrap();
+    buffer.trim().to_string()
+}
 
-    if !new_conf.contains(&rule_rtc) {
-        new_conf.push_str(&format!("\n{}\n", rule_rtc));
-        changed = true;
-    }
-    if !new_conf.contains(&rule_net) {
-        new_conf.push_str(&format!("{}\n", rule_net));
-        changed = true;
-    }
+fn load_config() -> PortalConfig {
+    let data = fs::read_to_string(CONFIG_FILE).expect("Не могу прочитать файл конфига");
+    serde_json::from_str(&data).expect("Ошибка формата конфига")
+}
 
-    if changed {
-        // Проверяем конфиг перед записью (doas -C conf_file)
-        let temp_file = "/tmp/doas_check.conf";
-        fs::write(temp_file, &new_conf).expect("Ошибка записи врем. файла");
+// === ЛОГИКА ДЕМОНА ===
+fn run_daemon(cfg: PortalConfig) {
+    let sleep_seconds = cfg.sleep_minutes * 60;
+    
+    println!("👻 Portal Daemon: WATCHER запущен.");
+    println!("🎯 Цель: {}", cfg.lighthouse_ip);
+    println!("⏱ Сон: {} мин | Грейс: {} сек", cfg.sleep_minutes, cfg.grace_period_sec);
 
-        let check = Command::new("doas").args(["-C", temp_file]).status();
-        
-        // doas -C может не быть на старых версиях, но если есть - проверим
-        if check.is_ok() && !check.unwrap().success() {
-             eprintln!("❌ Ошибка валидации doas.conf! Отмена.");
-             return;
+    loop {
+        if check_ping(&cfg.lighthouse_ip) {
+            // Свет есть — проверяем раз в минуту
+            thread::sleep(Duration::from_secs(60)); 
+        } else {
+            println!("⚠️  Маяк потерян! Ждем {} сек...", cfg.grace_period_sec);
+            thread::sleep(Duration::from_secs(cfg.grace_period_sec));
+
+            if check_ping(&cfg.lighthouse_ip) {
+                println!("✅ Маяк вернулся. Работаем дальше.");
+            } else {
+                println!("🌑 Света нет. Сон на {} минут.", cfg.sleep_minutes);
+                enter_hibernation(sleep_seconds);
+                println!("☀️  Проснулись. Ждем сеть 10 сек...");
+                thread::sleep(Duration::from_secs(10));
+            }
         }
-
-        fs::write(DOAS_CONF, new_conf).expect("Ошибка записи doas.conf");
-        println!("✅ Правила успешно добавлены в {}", DOAS_CONF);
-    } else {
-        println!("ℹ️  Правила для Doas уже существуют.");
     }
 }
 
-// --- ЛОГИКА SUDO ---
-fn setup_sudo(rtcwake: &str, nmcli: &str) {
-    let rule = format!(
-        "%{} ALL=(root) NOPASSWD: {}, {}\n",
-        GROUP_NAME, rtcwake, nmcli
-    );
-
-    let temp_file = "/tmp/portal_sudoers_check";
-    fs::write(temp_file, rule).expect("Ошибка записи");
-
-    let check = Command::new("visudo").args(["-c", "-f", temp_file]).output().expect("Ошибка visudo");
-
-    if check.status.success() {
-        fs::set_permissions(temp_file, fs::Permissions::from_mode(0o440)).unwrap();
-        Command::new("mv").args([temp_file, SUDOERS_FILE]).status().expect("Ошибка mv");
-        println!("✅ Правила Sudo успешно применены.");
-    } else {
-        eprintln!("❌ Ошибка валидации sudoers!");
+fn check_ping(ip: &str) -> bool {
+    let status = Command::new("ping")
+        .args(["-c", "1", "-W", "2", ip])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) => s.success(),
+        Err(_) => false,
     }
 }
 
-fn find_binary(bin_name: &str) -> Option<String> {
-    let output = Command::new("which").arg(bin_name).output().ok()?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() { None } else { Some(path) }
-    } else {
-        None
+fn enter_hibernation(seconds: u64) {
+    let priv_cmd = if Path::new(DOAS_CONF).exists() { "doas" } else { "sudo" };
+    
+    let status = Command::new(priv_cmd)
+        .args(["rtcwake", "-m", "mem", "-s", &seconds.to_string()])
+        .status();
+
+    if let Err(e) = status {
+        eprintln!("❌ Ошибка сна: {}", e);
+        thread::sleep(Duration::from_secs(60));
     }
 }
 
-fn run_daemon() {
-    println!("👻 Portal Daemon запущен...");
-    // Тут код проверки маяка
+// === СИСТЕМНАЯ УСТАНОВКА (То, что мы уже отладили) ===
+fn run_system_install() {
+    println!("🚀 Настройка системных прав (требуется root)...");
+    
+    let output = Command::new("id").arg("-u").output().expect("Fail");
+    if String::from_utf8_lossy(&output.stdout).trim() != "0" {
+        eprintln!("❌ Запустите с sudo/doas!"); std::process::exit(1);
+    }
+
+    let rtcwake = find_binary("rtcwake").expect("No rtcwake");
+    let nmcli = find_binary("nmcli").expect("No nmcli");
+
+    // Создаем группу
+    Command::new("groupadd").arg("-f").arg(GROUP_NAME).status().unwrap();
+    
+    // Ищем юзера
+    let real_user = match env::var("SUDO_USER") {
+        Ok(u) => Some(u),
+        Err(_) => env::var("DOAS_USER").ok(),
+    };
+
+    if let Some(user) = real_user {
+        Command::new("usermod").args(["-aG", GROUP_NAME, &user]).status().unwrap();
+        println!("✅ Юзер {} добавлен в группу.", user);
+    }
+
+    // Doas / Sudo config
+    if Path::new(DOAS_CONF).exists() {
+        setup_doas(&rtcwake, &nmcli);
+    } else {
+        setup_sudo(&rtcwake, &nmcli);
+    }
+    
+    println!("🎉 Системная настройка завершена. Теперь запустите без sudo для настройки конфига.");
+}
+
+// Вспомогательные для установки
+fn find_binary(bin: &str) -> Option<String> {
+    let out = Command::new("which").arg(bin).output().ok()?;
+    if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+}
+
+fn setup_doas(rtc: &str, net: &str) {
+    let rule_rtc = format!("permit nopass :{} cmd {}", GROUP_NAME, rtc);
+    let rule_net = format!("permit nopass :{} cmd {}", GROUP_NAME, net);
+    let mut conf = fs::read_to_string(DOAS_CONF).unwrap_or_default();
+    
+    // Делаем бэкап только если меняем
+    if !conf.contains(&rule_rtc) || !conf.contains(&rule_net) {
+         fs::copy(DOAS_CONF, format!("{}.bak", DOAS_CONF)).ok();
+    }
+
+    if !conf.contains(&rule_rtc) { conf.push_str(&format!("\n{}\n", rule_rtc)); }
+    if !conf.contains(&rule_net) { conf.push_str(&format!("{}\n", rule_net)); }
+    fs::write(DOAS_CONF, conf).expect("Write fail");
+    println!("✅ Doas настроен.");
+}
+
+fn setup_sudo(rtc: &str, net: &str) {
+    let rule = format!("%{} ALL=(root) NOPASSWD: {}, {}\n", GROUP_NAME, rtc, net);
+    let temp = "/tmp/portal_check";
+    fs::write(temp, rule).unwrap();
+    if Command::new("visudo").args(["-c", "-f", temp]).status().unwrap().success() {
+        fs::set_permissions(temp, fs::Permissions::from_mode(0o440)).unwrap();
+        Command::new("mv").args([temp, SUDOERS_FILE]).status().unwrap();
+        println!("✅ Sudo настроен.");
+    }
 }
