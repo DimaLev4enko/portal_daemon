@@ -1,5 +1,5 @@
 {
   "lighthouse_ip": "192.168.1.1",
   "sleep_minutes": 60,
-  "grace_period_sec": 300
+  "grace_period_sec": 0
 }
