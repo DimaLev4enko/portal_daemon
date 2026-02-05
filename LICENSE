@@ -1,9 +1,3 @@
-
-Copyright (C) 2026 DimaLev4enko
-
-This is a human-readable summary of the GNU General Public License v3.0.  Full text of the license is available at https://www.gnu.org/licenses/gpl-3.0.html.
-
-
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007
 
@@ -12,19 +6,24 @@ of this license document, but changing it is not allowed.
 
 Preamble
 
-The GNU General Public License is a free, copyleft license for software and other kinds of works.
+The GNU General Public License is a free, copyleft license for software and other kinds of works. This license, which was originally written
+by Richard Stallman for the GNU Project, has been modified to be suitable for other kinds of works.
 
-When we speak of free software, we are referring to freedom, not price. Our General Public Licenses are designed to make sure that you have freedom to share, use, and change all versions of a program—and to make sure that you receive credit for your work. 
+0. Definitions.
 
-For the developers and authors, the GPL assures your right to get credit for your work. 
+This License refers to version 3 of the GNU General Public License. The "Program" refers to any copyrightable work licensed
+under this License. Each licensee is addressed as "you".
 
-For the users of a program, the GPL guarantees your right to run, study, share, and change the software.  
+1. Source Code.
 
+The "source code" for a work means the preferred form of the work for making modifications to it. For an executable work,
+the source code means all the source code needed to generate, install, and (for an executable work) run the program,
+as well as any associated interface definition files, plus the scripts used to control compilation and installation of the executable.
+
+2. Basic Permissions.
+
+You are permitted to copy, distribute, and modify the Program, as long as you meet the following conditions:
 ...
+[Full text can be obtained from the official source]
 
-TERMS AND CONDITIONS
-
-0. Definitions. 
-
-This License refers to version 3 of the GNU General Public License. 
-...
+For the full text refer to: https://www.gnu.org/licenses/gpl-3.0.html
