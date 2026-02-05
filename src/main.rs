@@ -1,18 +1,19 @@
 use clap::Parser;
-use dialoguer::{Input, Select, theme::ColorfulTheme}; // Подключаем библиотеку меню
+use dialoguer::{theme::ColorfulTheme, Input, Select};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use std::os::unix::fs::PermissionsExt;
 
 // --- КОНФИГУРАЦИЯ ---
 #[derive(Serialize, Deserialize, Debug)]
 struct PortalConfig {
     lighthouse_ip: String,
+    target_ssid: String,
     sleep_minutes: u64,
     grace_period_sec: u64,
 }
@@ -21,6 +22,7 @@ impl Default for PortalConfig {
     fn default() -> Self {
         Self {
             lighthouse_ip: "192.168.1.1".to_string(),
+            target_ssid: "Unknown".to_string(),
             sleep_minutes: 60,
             grace_period_sec: 300,
         }
@@ -59,72 +61,61 @@ fn main() {
     run_daemon(config);
 }
 
-// === МАСТЕР НАСТРОЙКИ (TUI) ===
+struct NetworkInfo {
+    ssid: String,
+    device: String,
+    gateway: String,
+}
+
+// === МАСТЕР НАСТРОЙКИ ===
 fn run_interactive_wizard() -> PortalConfig {
     println!("\n🔧 --- МАСТЕР НАСТРОЙКИ PORTAL ---");
 
-    // Меню выбора метода
-    let selections = &[
-        "Ввести IP вручную (Рекомендуется)",
-        "Найти шлюз автоматически (через nmcli)",
-    ];
+    let mut final_ip = String::new();
+    let mut final_ssid = "Manual".to_string();
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Как будем искать Маяк (Удлинитель/Роутер)?")
-        .default(0) // По умолчанию - первый пункт (Ручной)
-        .items(&selections[..])
-        .interact()
-        .unwrap();
+    println!("🔍 Сканирую активные подключения...");
+    let networks = scan_networks();
 
-    let ip: String;
-
-    if selection == 0 {
-        // Ручной ввод
-        ip = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Введи IP адрес Маяка")
+    if networks.is_empty() {
+        println!("❌ Авто-скан не нашел шлюзов. Возможно, сеть не настроена или nmcli выдает нестандартный вывод.");
+        final_ip = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Введи IP Маяка (шлюза) вручную")
             .default("192.168.1.1".into())
             .interact_text()
             .unwrap();
     } else {
-        // Автоматика
-        println!("🔍 Сканирую сеть через nmcli...");
-        if let Some(gateway) = get_default_gateway() {
-            println!("✅ Найден шлюз: {}", gateway);
+        let mut options: Vec<String> = networks.iter()
+            .map(|n| format!("{} (Dev: {}, GW: {})", n.ssid, n.device, n.gateway))
+            .collect();
+        options.push("Ввести IP вручную".to_string());
 
-            // Спрашиваем подтверждение
-            let confirm_selections = &["Да, использовать этот IP", "Нет, ввести другой вручную"];
-            let confirm = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Использовать этот IP?")
-                .default(0)
-                .items(&confirm_selections[..])
-                .interact()
-                .unwrap();
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Выбери сеть:")
+            .default(0)
+            .items(&options)
+            .interact()
+            .unwrap();
 
-            if confirm == 0 {
-                ip = gateway;
-            } else {
-                ip = Input::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Введи IP адрес вручную")
-                    .interact_text()
-                    .unwrap();
-            }
+        if selection < networks.len() {
+            let selected = &networks[selection];
+            final_ip = selected.gateway.clone();
+            final_ssid = selected.ssid.clone();
+            println!("✅ Выбрана сеть: {}", final_ssid);
         } else {
-            println!("❌ Шлюз не найден.");
-            ip = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Введи IP адрес вручную")
+            final_ip = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Введи IP Маяка")
                 .interact_text()
                 .unwrap();
         }
     }
 
-    // Ввод времени сна
     let sleep_minutes: u64 = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Сколько МИНУТ спать без света?")
         .default(60)
         .interact_text()
         .unwrap();
 
-    // Ввод грейс-периода
     let grace_period_sec: u64 = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("Грейс-период (сек) перед сном?")
         .default(300)
@@ -132,7 +123,8 @@ fn run_interactive_wizard() -> PortalConfig {
         .unwrap();
 
     let config = PortalConfig {
-        lighthouse_ip: ip,
+        lighthouse_ip: final_ip,
+        target_ssid: final_ssid,
         sleep_minutes,
         grace_period_sec,
     };
@@ -140,25 +132,65 @@ fn run_interactive_wizard() -> PortalConfig {
     let json = serde_json::to_string_pretty(&config).expect("Fail json");
     fs::write(CONFIG_FILE, json).expect("Fail write");
     println!("✅ Настройки сохранены!\n");
-
     config
 }
 
-// --- ФУНКЦИИ ---
+// --- НОВАЯ ЛОГИКА СКАНИРОВАНИЯ ---
+fn scan_networks() -> Vec<NetworkInfo> {
+    let mut results = Vec::new();
 
-fn get_default_gateway() -> Option<String> {
-    let output = Command::new("nmcli").args(["dev", "show"]).output().ok()?;
+    // 1. Получаем список [ИМЯ]:[УСТРОЙСТВО]
+    // Твой вывод показал: lox_2.4G:wlp3s0
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "NAME,DEVICE", "connection", "show", "--active"])
+        .output()
+        .ok();
 
-    if !output.status.success() {
-        return None;
+    if let Some(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            // parts[0] = lox_2.4G, parts[1] = wlp3s0
+            if parts.len() >= 2 {
+                let ssid = parts[0].to_string();
+                let device = parts[1].to_string();
+
+                // Игнорируем loopback (lo) и устройства без имени
+                if device == "lo" || ssid.is_empty() { continue; }
+
+                // 2. Ищем шлюз для этого конкретного устройства
+                if let Some(gw) = get_gateway_for_device(&device) {
+                    results.push(NetworkInfo {
+                        ssid,
+                        device,
+                        gateway: gw,
+                    });
+                }
+            }
+        }
     }
+    results
+}
 
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    for line in out_str.lines() {
-        if line.contains("IP4.GATEWAY") {
-            if let Some(value) = line.split_whitespace().last() {
-                if value != "--" && !value.is_empty() {
-                    return Some(value.to_string());
+fn get_gateway_for_device(dev: &str) -> Option<String> {
+    // Мы убрали флаг "-f", чтобы не злить твой nmcli.
+    // Просто берем ВСЮ инфу: nmcli -t dev show wlp3s0
+    let output = Command::new("nmcli")
+        .args(["-t", "dev", "show", dev])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Ищем строку, которая начинается с IP4.GATEWAY
+    for line in stdout.lines() {
+        if line.starts_with("IP4.GATEWAY:") {
+            // Строка выглядит так: "IP4.GATEWAY:192.168.1.1"
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 2 {
+                let gw = parts[1].trim().to_string();
+                if !gw.is_empty() && gw != "--" {
+                    return Some(gw);
                 }
             }
         }
@@ -174,17 +206,18 @@ fn load_config() -> PortalConfig {
 fn run_daemon(cfg: PortalConfig) {
     let sleep_seconds = cfg.sleep_minutes * 60;
     println!("👻 Portal Daemon: START");
+    println!("📡 Сеть: {}", cfg.target_ssid);
     println!("🎯 Маяк: {}", cfg.lighthouse_ip);
 
     loop {
         if check_ping(&cfg.lighthouse_ip) {
-            thread::sleep(Duration::from_secs(60));
+            thread::sleep(Duration::from_secs(60)); 
         } else {
-            println!("⚠️  Связь потеряна. Ждем {} сек...", cfg.grace_period_sec);
+            println!("⚠️  Потеря связи. Ждем {} сек...", cfg.grace_period_sec);
             thread::sleep(Duration::from_secs(cfg.grace_period_sec));
 
             if check_ping(&cfg.lighthouse_ip) {
-                println!("✅ Связь восстановлена.");
+                println!("✅ Связь вернулась.");
             } else {
                 println!("🌑 Света нет. Сон {} мин.", cfg.sleep_minutes);
                 enter_hibernation(sleep_seconds);
@@ -208,11 +241,7 @@ fn check_ping(ip: &str) -> bool {
 }
 
 fn enter_hibernation(seconds: u64) {
-    let priv_cmd = if Path::new(DOAS_CONF).exists() {
-        "doas"
-    } else {
-        "sudo"
-    };
+    let priv_cmd = if Path::new(DOAS_CONF).exists() { "doas" } else { "sudo" };
     let status = Command::new(priv_cmd)
         .args(["rtcwake", "-m", "mem", "-s", &seconds.to_string()])
         .status();
@@ -226,54 +255,33 @@ fn run_system_install() {
     println!("🚀 Setup permissions...");
     let out = Command::new("id").arg("-u").output().unwrap();
     if String::from_utf8_lossy(&out.stdout).trim() != "0" {
-        eprintln!("Need root!");
-        std::process::exit(1);
+        eprintln!("Need root!"); std::process::exit(1);
     }
     let rtc = find_binary("rtcwake").expect("No rtcwake");
     let net = find_binary("nmcli").expect("No nmcli");
 
-    Command::new("groupadd")
-        .arg("-f")
-        .arg(GROUP_NAME)
-        .status()
-        .unwrap();
+    Command::new("groupadd").arg("-f").arg(GROUP_NAME).status().unwrap();
     let user = env::var("SUDO_USER").ok().or(env::var("DOAS_USER").ok());
     if let Some(u) = user {
-        Command::new("usermod")
-            .args(["-aG", GROUP_NAME, &u])
-            .status()
-            .unwrap();
+        Command::new("usermod").args(["-aG", GROUP_NAME, &u]).status().unwrap();
     }
-    if Path::new(DOAS_CONF).exists() {
-        setup_doas(&rtc, &net);
-    } else {
-        setup_sudo(&rtc, &net);
-    }
+    if Path::new(DOAS_CONF).exists() { setup_doas(&rtc, &net); } 
+    else { setup_sudo(&rtc, &net); }
     println!("🎉 Done.");
 }
 
 fn find_binary(bin: &str) -> Option<String> {
     let out = Command::new("which").arg(bin).output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
+    if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
 }
 
 fn setup_doas(rtc: &str, net: &str) {
     let r1 = format!("permit nopass :{} cmd {}", GROUP_NAME, rtc);
     let r2 = format!("permit nopass :{} cmd {}", GROUP_NAME, net);
     let mut c = fs::read_to_string(DOAS_CONF).unwrap_or_default();
-    if !c.contains(&r1) || !c.contains(&r2) {
-        fs::copy(DOAS_CONF, format!("{}.bak", DOAS_CONF)).ok();
-    }
-    if !c.contains(&r1) {
-        c.push_str(&format!("\n{}\n", r1));
-    }
-    if !c.contains(&r2) {
-        c.push_str(&format!("{}\n", r2));
-    }
+    if !c.contains(&r1) || !c.contains(&r2) { fs::copy(DOAS_CONF, format!("{}.bak", DOAS_CONF)).ok(); }
+    if !c.contains(&r1) { c.push_str(&format!("\n{}\n", r1)); }
+    if !c.contains(&r2) { c.push_str(&format!("{}\n", r2)); }
     fs::write(DOAS_CONF, c).unwrap();
 }
 
@@ -281,12 +289,7 @@ fn setup_sudo(rtc: &str, net: &str) {
     let r = format!("%{} ALL=(root) NOPASSWD: {}, {}\n", GROUP_NAME, rtc, net);
     let t = "/tmp/portal_check";
     fs::write(t, r).unwrap();
-    if Command::new("visudo")
-        .args(["-c", "-f", t])
-        .status()
-        .unwrap()
-        .success()
-    {
+    if Command::new("visudo").args(["-c", "-f", t]).status().unwrap().success() {
         fs::set_permissions(t, fs::Permissions::from_mode(0o440)).unwrap();
         Command::new("mv").args([t, SUDOERS_FILE]).status().unwrap();
     }
