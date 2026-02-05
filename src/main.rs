@@ -3,13 +3,24 @@ use dialoguer::{Input, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::Write; // Нужно для записи файлов
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-// --- КОНФИГУРАЦИЯ ---
+// --- КОНФИГУРАЦИЯ И ПУТИ ---
+const CONFIG_DIR: &str = "/etc/portal_daemon";
+const CONFIG_FILE: &str = "/etc/portal_daemon/config.json";
+const PAUSE_FILE: &str = "/tmp/portal.pause";
+
+// Для установки
+const BINARY_DEST: &str = "/usr/local/bin/portal_daemon";
+const GROUP_NAME: &str = "portal-admins";
+const DOAS_CONF: &str = "/etc/doas.conf";
+const SUDOERS_FILE: &str = "/etc/sudoers.d/portal-daemon";
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 enum Language {
     En,
@@ -18,7 +29,7 @@ enum Language {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PortalConfig {
-    language: Language, // НОВОЕ ПОЛЕ
+    language: Language,
     lighthouse_ip: String,
     target_ssid: String,
     sleep_minutes: u64,
@@ -53,14 +64,14 @@ struct Args {
     off: bool,
 }
 
-const CONFIG_FILE: &str = "portal_config.json";
-const PAUSE_FILE: &str = "/tmp/portal.pause";
-const GROUP_NAME: &str = "portal-admins";
-const DOAS_CONF: &str = "/etc/doas.conf";
-const SUDOERS_FILE: &str = "/etc/sudoers.d/portal-daemon";
-
 fn main() {
     let args = Args::parse();
+
+    // 1. Установка (требует root)
+    if args.install {
+        run_system_install();
+        return;
+    }
 
     // Загружаем конфиг (если есть), чтобы знать язык для меню
     let mut temp_lang = Language::En;
@@ -68,29 +79,36 @@ fn main() {
         temp_lang = cfg.language;
     }
 
+    // 2. Меню управления (выключить/пауза)
     if args.off {
         run_control_menu(temp_lang);
         return;
     }
-    if args.install {
-        run_system_install();
-        return;
-    }
 
+    // 3. Логика загрузки конфига или визарда
+    // Если конфига нет ИЛИ явно попросили --configure
     let config = if args.configure || !Path::new(CONFIG_FILE).exists() {
+        // Проверяем права, так как писать будем в /etc
+        if !is_root() {
+            println!(
+                "⚠️  Config setup requires ROOT permissions to write to {}.",
+                CONFIG_FILE
+            );
+            println!("⚠️  Please run with sudo/doas.");
+            std::process::exit(1);
+        }
         run_interactive_wizard()
     } else {
         load_config_safe().unwrap_or_default()
     };
 
+    // 4. Запуск демона
     run_daemon(config);
 }
 
 // --- СЛОВАРЬ (LOCALIZATION) ---
 struct Locales {
-    // Menu & Wizard
     wizard_title: String,
-    select_lang: String,
     scan_msg: String,
     scan_fail: String,
     enter_ip_manual: String,
@@ -103,7 +121,6 @@ struct Locales {
     scan_int_prompt: String,
     settings_saved: String,
 
-    // Daemon
     daemon_start: String,
     daemon_net: String,
     daemon_interval: String,
@@ -112,7 +129,6 @@ struct Locales {
     no_light_sleep: String,
     waking_up: String,
 
-    // Control
     ctrl_title: String,
     ctrl_action: String,
     ctrl_pause: String,
@@ -130,7 +146,6 @@ impl Locales {
         match lang {
             Language::En => Locales {
                 wizard_title: "\n🔧 --- PORTAL SETUP WIZARD ---".into(),
-                select_lang: "Select Language".into(),
                 scan_msg: "🔍 Scanning networks...".into(),
                 scan_fail: "❌ No networks found.".into(),
                 enter_ip_manual: "Enter Lighthouse IP Manually".into(),
@@ -141,7 +156,7 @@ impl Locales {
                 grace_sec_prompt: "Grace period (sec) before sleep?".into(),
                 wakeup_sec_prompt: "Wait (sec) after waking up?".into(),
                 scan_int_prompt: "Scan interval (sec)?".into(),
-                settings_saved: "✅ Settings saved!".into(),
+                settings_saved: format!("✅ Settings saved to {}!", CONFIG_FILE),
 
                 daemon_start: "👻 Portal Daemon: START".into(),
                 daemon_net: "📡 Network:".into(),
@@ -164,7 +179,6 @@ impl Locales {
             },
             Language::Ru => Locales {
                 wizard_title: "\n🔧 --- МАСТЕР НАСТРОЙКИ PORTAL ---".into(),
-                select_lang: "Выберите язык / Select Language".into(),
                 scan_msg: "🔍 Сканирую сети...".into(),
                 scan_fail: "❌ Сети не найдены.".into(),
                 enter_ip_manual: "Ввести IP Маяка вручную".into(),
@@ -175,7 +189,7 @@ impl Locales {
                 grace_sec_prompt: "Грейс-период (сек) перед сном?".into(),
                 wakeup_sec_prompt: "Ждать сек. после включения?".into(),
                 scan_int_prompt: "Интервал проверки (сек)?".into(),
-                settings_saved: "✅ Настройки сохранены!".into(),
+                settings_saved: format!("✅ Настройки сохранены в {}!", CONFIG_FILE),
 
                 daemon_start: "👻 Portal Daemon: ЗАПУСК".into(),
                 daemon_net: "📡 Сеть:".into(),
@@ -246,11 +260,16 @@ fn run_control_menu(lang: Language) {
 
 // === МАСТЕР НАСТРОЙКИ ===
 fn run_interactive_wizard() -> PortalConfig {
-    // 1. Спрашиваем язык ПЕРВЫМ ДЕЛОМ
+    // Создаем директорию конфига, если нет
+    if !Path::new(CONFIG_DIR).exists() {
+        println!("📂 Creating config directory: {}", CONFIG_DIR);
+        fs::create_dir_all(CONFIG_DIR).expect("Failed to create config dir");
+    }
+
     let langs = &["English (Default)", "Русский"];
     let lang_sel = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select Language / Выберите язык")
-        .default(0) // English is default
+        .default(0)
         .items(&langs[..])
         .interact()
         .unwrap();
@@ -260,7 +279,7 @@ fn run_interactive_wizard() -> PortalConfig {
     } else {
         Language::En
     };
-    let t = Locales::new(lang); // Загружаем тексты
+    let t = Locales::new(lang);
 
     println!("{}", t.wizard_title);
 
@@ -327,7 +346,7 @@ fn run_interactive_wizard() -> PortalConfig {
         .unwrap();
 
     let config = PortalConfig {
-        language: lang, // Сохраняем язык
+        language: lang,
         lighthouse_ip: final_ip,
         target_ssid: final_ssid,
         sleep_minutes,
@@ -344,7 +363,7 @@ fn run_interactive_wizard() -> PortalConfig {
 
 // === ДЕМОН ===
 fn run_daemon(cfg: PortalConfig) {
-    let t = Locales::new(cfg.language); // Загружаем тексты на основе конфига
+    let t = Locales::new(cfg.language);
     let sleep_seconds = cfg.sleep_minutes * 60;
 
     println!("{}", t.daemon_start);
@@ -482,40 +501,47 @@ fn enter_hibernation(seconds: u64) {
         .args(["rtcwake", "-m", "mem", "-s", &seconds.to_string()])
         .status();
 
-    let success = match status_result {
-        Ok(s) if s.success() => {
+    if let Ok(s) = status_result {
+        if s.success() {
             println!("✅ Sleep OK.");
-            true
+            return;
         }
-        Ok(_) => {
-            eprintln!("❌ Error: rtcwake failed. Password required?");
-            false
-        }
-        Err(e) => {
-            eprintln!("❌ Execution error: {}", e);
-            false
-        }
-    };
-    if !success {
-        thread::sleep(Duration::from_secs(60));
     }
+    eprintln!("❌ Error: rtcwake failed.");
+    thread::sleep(Duration::from_secs(60));
 }
 
-fn run_system_install() {
-    println!("🚀 Setup permissions (System Install)...");
-
+fn is_root() -> bool {
     let out = Command::new("id").arg("-u").output().unwrap();
-    if String::from_utf8_lossy(&out.stdout).trim() != "0" {
-        eprintln!("❌ Error: Run as root (sudo/doas)!");
+    String::from_utf8_lossy(&out.stdout).trim() == "0"
+}
+
+// === УСТАНОВКА СИСТЕМЫ И СЕРВИСОВ ===
+fn run_system_install() {
+    println!("🚀 Starting SYSTEM INSTALL...");
+    if !is_root() {
+        eprintln!("❌ Error: Install must be run as root (sudo/doas)!");
         std::process::exit(1);
     }
 
-    let rtc = find_binary("rtcwake").expect("❌ rtcwake not found!");
-    let net = find_binary("nmcli").expect("❌ nmcli not found!");
-    println!("   ✅ rtcwake: {}", rtc);
-    println!("   ✅ nmcli:   {}", net);
+    // 1. Копирование бинарника
+    if let Ok(current_exe) = env::current_exe() {
+        println!("📦 Copying binary to {}...", BINARY_DEST);
+        if let Err(e) = fs::copy(&current_exe, BINARY_DEST) {
+            eprintln!("❌ Failed to copy binary: {}", e);
+        } else {
+            // Делаем исполняемым (на всякий случай)
+            fs::set_permissions(BINARY_DEST, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    } else {
+        eprintln!("❌ Cannot find current executable path.");
+    }
 
-    println!("👤 Check group {}...", GROUP_NAME);
+    // 2. Настройка прав (sudo/doas)
+    let rtc = find_binary("rtcwake").unwrap_or_else(|| "/usr/sbin/rtcwake".to_string());
+    let net = find_binary("nmcli").unwrap_or_else(|| "/usr/bin/nmcli".to_string());
+
+    println!("👤 Creating group {}...", GROUP_NAME);
     Command::new("groupadd")
         .arg("-f")
         .arg(GROUP_NAME)
@@ -523,13 +549,11 @@ fn run_system_install() {
         .unwrap();
 
     if let Some(u) = env::var("SUDO_USER").ok().or(env::var("DOAS_USER").ok()) {
-        println!("👤 Add user '{}' to group...", u);
+        println!("👤 Adding user '{}' to group...", u);
         Command::new("usermod")
             .args(["-aG", GROUP_NAME, &u])
             .status()
             .unwrap();
-    } else {
-        println!("⚠️  User unknown (root shell?).");
     }
 
     if Path::new(DOAS_CONF).exists() {
@@ -538,7 +562,82 @@ fn run_system_install() {
         setup_sudo(&rtc, &net);
     }
 
-    println!("\n🎉 Setup Done. PLEASE RELOGIN/REBOOT!");
+    // 3. Установка сервиса (Systemd vs OpenRC)
+    install_service();
+
+    println!("\n🎉 INSTALLATION COMPLETE!");
+    println!("👉 Run 'portal_daemon --configure' to set up IPs.");
+}
+
+fn install_service() {
+    // Проверяем Systemd
+    if Path::new("/run/systemd/system").exists() || Path::new("/usr/lib/systemd").exists() {
+        println!("⚙️  Detected Systemd.");
+        let service_content = format!(
+            r#"[Unit]
+Description=Portal Daemon (Network Sleep Manager)
+After=network.target
+
+[Service]
+ExecStart={}
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+"#,
+            BINARY_DEST
+        );
+
+        let service_path = "/etc/systemd/system/portal.service";
+        fs::write(service_path, service_content).expect("Failed to write service file");
+        println!("   📄 Created {}", service_path);
+
+        Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status()
+            .ok();
+        Command::new("systemctl")
+            .args(["enable", "--now", "portal"])
+            .status()
+            .ok();
+        println!("   ✅ Service enabled & started.");
+    } else {
+        // Предполагаем OpenRC (Gentoo/Artix)
+        println!("⚙️  Detected OpenRC (or fallback).");
+        let openrc_content = format!(
+            r#"#!/sbin/openrc-run
+
+name="portal"
+description="Portal Daemon"
+command="{}"
+command_background=true
+pidfile="/run/portal.pid"
+
+depend() {{
+    need net
+}}
+"#,
+            BINARY_DEST
+        );
+
+        let init_path = "/etc/init.d/portal";
+        fs::write(init_path, openrc_content).expect("Failed to write init script");
+        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755))
+            .expect("Failed to chmod init script");
+        println!("   📄 Created {} (executable)", init_path);
+
+        Command::new("rc-update")
+            .args(["add", "portal", "default"])
+            .status()
+            .ok();
+        Command::new("rc-service")
+            .args(["portal", "start"])
+            .status()
+            .ok();
+        println!("   ✅ Service added to default runlevel & started.");
+    }
 }
 
 fn find_binary(bin: &str) -> Option<String> {
@@ -552,36 +651,23 @@ fn find_binary(bin: &str) -> Option<String> {
 }
 
 fn setup_doas(rtc: &str, net: &str) {
-    println!("🦅 Doas detected. Updating {}...", DOAS_CONF);
-
+    println!("🦅 Configuring Doas...");
     let r1 = format!("permit nopass :{} cmd {}", GROUP_NAME, rtc);
     let r2 = format!("permit nopass :{} cmd {}", GROUP_NAME, net);
-
     let mut c = fs::read_to_string(DOAS_CONF).unwrap_or_default();
-    let mut changed = false;
 
     if !c.contains(&r1) {
-        println!("   ➕ Add: {}", r1);
         c.push_str(&format!("\n{}\n", r1));
-        changed = true;
     }
-
     if !c.contains(&r2) {
-        println!("   ➕ Add: {}", r2);
         c.push_str(&format!("{}\n", r2));
-        changed = true;
     }
 
-    if changed {
-        fs::copy(DOAS_CONF, format!("{}.bak", DOAS_CONF)).ok();
-        fs::write(DOAS_CONF, c).unwrap();
-        println!("📝 Doas updated.");
-    } else {
-        println!("ℹ️  No changes needed.");
-    }
+    fs::write(DOAS_CONF, c).unwrap();
 }
+
 fn setup_sudo(rtc: &str, net: &str) {
-    println!("🐧 Sudo detected.");
+    println!("🐧 Configuring Sudo...");
     let r = format!("%{} ALL=(root) NOPASSWD: {}, {}\n", GROUP_NAME, rtc, net);
     let t = "/tmp/portal_check";
     fs::write(t, r).unwrap();
@@ -594,8 +680,5 @@ fn setup_sudo(rtc: &str, net: &str) {
     {
         fs::set_permissions(t, fs::Permissions::from_mode(0o440)).unwrap();
         Command::new("mv").args([t, SUDOERS_FILE]).status().unwrap();
-        println!("✅ Sudoers updated.");
-    } else {
-        eprintln!("❌ Visudo check failed!");
     }
 }
