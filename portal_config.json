@@ -1,6 +1,7 @@
 {
   "lighthouse_ip": "192.168.1.1",
   "target_ssid": "lox_2.4G",
-  "sleep_minutes": 50,
-  "grace_period_sec": 10
+  "sleep_minutes": 1,
+  "grace_period_sec": 10,
+  "wakeup_wait_sec": 15
 }
